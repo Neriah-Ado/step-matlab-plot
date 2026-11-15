@@ -1,0 +1,46 @@
+id: step-matlab-plot
+name: Step Matlab Plot
+description: "MATLAB 画图插件：结构化规格生成出版级图表（16 类图形，导出 png/pdf/svg/jpg/fig），持久化会话复用 MATLAB，任意 MATLAB 代码默认 dry-run、confirm 后执行"
+form: hybrid
+priority: P2
+effort: M
+status: done
+manifest: step.plugin.json
+requires_env: []
+verify:
+  - "fake 缝端到端：env→plot（16 类图形）→plot_many→ls→read 全流程"
+  - "真机 MATLAB（R2026a）16 类会话模式矩阵出图并被视觉验证"
+  - "会话相对一次性提速 ≥50%（实测 93.4%）"
+  - "5+5+5 个子代理并行验证发现的问题全部修复并回归通过"
+versions:
+  - version: "1.0.0"
+    type: major
+    theme: 首次公开发布
+    status: done
+    notes: "持久化 MATLAB 会话（真机 3 图 4.1s vs 61.5s，提速 93.4%）；16 类图形；批量绘图；checkcode 预检；完整安全闸；56 单测 + 17 冒烟 + 真机 7/7 轮次验证。设计参考 MathWorks 官方 matlab-mcp-server / matlab-agentic-toolkit / matlab/rules；内部迭代历程见 CHANGELOG「预发布历史」"
+    tasks:
+      - id: MP-100-1
+        title: "持久化 MATLAB 会话 daemon（queue/results、双通道心跳、看门狗、单飞、降级）"
+        done: true
+      - id: MP-100-2
+        title: "16 类图形代码生成 + 5 种导出格式（位图 print -r96 精确尺寸）"
+        done: true
+      - id: MP-100-3
+        title: "matlab_plot_many 批量绘图 + checkcode 预检 + 产物自验证 + sidecar"
+        done: true
+      - id: MP-100-4
+        title: "安全：G3/C-05、spec 全数据化、形状前置校验、会话隔离、GBK 解码"
+        done: true
+      - id: MP-100-5
+        title: "测试：56 单测 + 17 冒烟 + 真机轮次验证 + fake 缝 daemon 协议"
+        done: true
+      - id: MP-100-6
+        title: "发布：README/SKILL/命令/CHANGELOG/NOTICE/LICENSE/.gitignore"
+        done: true
+    acceptance:
+      - "fake 缝全协议冒烟通过；真机 16 类会话模式矩阵出图"
+      - "会话相对一次性提速 ≥50%（实测 93.4%）"
+      - "并发冷启动单飞；同名重画反映新数据；位图尺寸精确"
+      - "颜色/路径/数据注入载荷在生成期被拒"
+    risks:
+      - "Windows 信号 kill 不执行 JS 清理：孤儿 daemon 由 90s 看门狗回收（已知限制）"

@@ -1,0 +1,9 @@
+# NOTICE
+
+本插件的设计参考了以下 MathWorks 官方开源项目（各自遵循其许可）：
+
+- [matlab/matlab-mcp-server](https://github.com/matlab/matlab-mcp-server) — 持久化 MATLAB 会话模式与 `check_matlab_code`（Code Analyzer 执行前预检）的设计思路
+- [matlab/matlab-agentic-toolkit](https://github.com/matlab/matlab-agentic-toolkit) — skills 目录结构
+- [matlab/rules](https://github.com/matlab/rules) — MATLAB Coding Standards（CC BY 4.0），生成代码的命名与格式规范
+
+MATLAB 为 MathWorks 注册商标。本插件与 MathWorks 无关联，也未使用其任何专有代码。

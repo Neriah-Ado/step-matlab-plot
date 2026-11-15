@@ -1,0 +1,20 @@
+{
+  "id": "step-matlab-plot",
+  "name": "Step Matlab Plot",
+  "description": "MATLAB 画图：结构化规格生成图表（line/scatter/bar/barh/histogram/area/pie/stem/stairs/errorbar/loglog/semilogx/semilogy/boxplot/surf/heatmap 共 16 类），导出 png/pdf/svg/jpg/fig；matlab_run 任意代码默认 dry-run、confirm=true 才执行。",
+  "version": "1.0.0",
+  "commands": [
+    "commands/matlab-plot.md"
+  ],
+  "skills": [
+    "skills/matlab-plot/SKILL.md"
+  ],
+  "mcpServers": {
+    "step-matlab-plot": {
+      "command": "node",
+      "args": [
+        "server/index.mjs"
+      ]
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "type": "line",
+  "name": "example-line",
+  "format": "png",
+  "title": "双序列趋势示例",
+  "xlabel": "t (s)",
+  "ylabel": "amplitude",
+  "data": {
+    "x": [0, 1, 2, 3, 4, 5, 6],
+    "y": [
+      [0, 0.84, 0.91, 0.14, -0.76, -0.96, -0.28],
+      [1, 0.54, -0.42, -0.99, -0.65, 0.28, 0.96]
+    ]
+  },
+  "series": [
+    { "name": "sin(t)" },
+    { "name": "cos(t)", "lineStyle": "--" }
+  ],
+  "style": { "lineWidth": 1.6 },
+  "grid": true,
+  "legend": "auto",
+  "size": { "width": 960, "height": 600 }
+}
