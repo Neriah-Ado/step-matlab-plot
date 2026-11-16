@@ -268,6 +268,93 @@ test('回归：colormap 白名单 / catch 带 name / print 精确导出 / 句柄
   assert.match(st.value.code, /chartHandles = stem\(xData, yData\);/);
 });
 
+test('回归：陈旧 sidecar 在投递前被清理（不再冒领）', async () => {
+  const built = buildPlotScript({ type: 'line', name: 'stale-sidecar', data: { y: [1, 2] } }, OUT);
+  const p = scriptPathFor(OUT, 'stale-sidecar');
+  writeFileSync(p, built.value.code.replace(/%SELF_PATH%/g, p.replace(/\\/g, '/')), 'utf8');
+  // 预置一个 name 错误的陈旧 sidecar
+  writeFileSync(`${p}.result.json`, JSON.stringify({ ok: true, name: 'WRONG-NAME' }), 'utf8');
+  const r = await execScript(p, { outDir: OUT, timeoutMs: 30000 });
+  // 结果必须来自本次执行（name 正确），且 sidecar 已被读取清理
+  assert.equal(r.result?.name, 'stale-sidecar', JSON.stringify(r.result)?.slice(0, 200));
+  assert.equal(existsSync(`${p}.result.json`), false, 'sidecar 应被读取后清理');
+});
+
+test('回归：dryRun 截断字段与保留名多段检查', () => {
+  const big = buildPlotScript({ type: 'line', name: 'trunc', data: { y: new Array(200000).fill(1) } }, OUT);
+  assert.equal(big.ok, true);
+  assert.equal(big.value.code.length > 50000, true);
+  // handlePlot 的 dryRun 走 truncateCode：直接验证函数行为（经 index 导出不可达，复刻判定）
+  const truncate = (code) => (code.length <= 50000 ? code : `${code.slice(0, 50000)}\n...[代码过长已截断，共 ${code.length} 字符；正式调用将完整执行]`);
+  const t = truncate(big.value.code);
+  assert.equal(t.length < big.value.code.length, true);
+  assert.match(t, /代码过长已截断，共 \d+ 字符/);
+  // 多段保留名
+  assert.equal(buildPlotScript({ type: 'line', name: 'nul.a.b', data: { y: [1] } }, OUT).ok, false);
+  assert.equal(buildPlotScript({ type: 'line', name: 'aux.foo.bar', data: { y: [1] } }, OUT).ok, false);
+  assert.equal(buildPlotScript({ type: 'line', name: 'data.nul', data: { y: [1] } }, OUT).ok, true);
+});
+
+test('回归：fake 缝坏 job 快速失败（id 回填）', async () => {
+  process.env.FAKE_MATLAB_IDLE_MS = '60000';
+  const { writeFileSync: w, mkdirSync: mk, readFileSync: rf, existsSync: ex } = await import('node:fs');
+  const queueDir = join(OUT, '.session', 'queue');
+  const resultsDir = join(OUT, '.session', 'results');
+  mk(queueDir, { recursive: true });
+  mk(resultsDir, { recursive: true });
+  // 先起一个 fake daemon 会话
+  const built = buildPlotScript({ type: 'line', name: 'fake-bad-warm', data: { y: [1] } }, OUT);
+  const p = scriptPathFor(OUT, 'fake-bad-warm');
+  w(p, built.value.code.replace(/%SELF_PATH%/g, p.replace(/\\/g, '/')), 'utf8');
+  await execScript(p, { outDir: OUT, timeoutMs: 30000 });
+  // 投放坏 job
+  const badId = `j${process.pid}_badjob_1`;
+  w(join(queueDir, `${badId}.job`), '{ not valid json !!!', 'utf8');
+  // 等 daemon 处理
+  const deadline = Date.now() + 15000;
+  let parsed = null;
+  while (Date.now() < deadline) {
+    const resFile = join(resultsDir, `${badId}.res`);
+    if (ex(resFile)) {
+      try { parsed = JSON.parse(rf(resFile, 'utf8')); break; } catch { /* 继续等 */ }
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(parsed, '坏 job 应在 15s 内产生结果');
+  assert.equal(parsed.id, badId, `id 应回填为 ${badId}，实际 ${parsed.id}`);
+  assert.equal(parsed.ok, false);
+  await stopSession(OUT);
+  delete process.env.FAKE_MATLAB_IDLE_MS;
+});
+
+test('回归：控制字符标准对齐（toStrVector 与 validateText 一致）', () => {
+  assert.equal(buildPlotScript({ type: 'pie', data: { y: [1, 2], labels: ['a\nb'] } }, OUT).ok, false);
+  assert.equal(buildPlotScript({ type: 'line', legend: ['a\rb'], data: { y: [1] } }, OUT).ok, false);
+  assert.equal(buildPlotScript({ type: 'line', data: { x: ['a\tb', 'c'], y: [1, 2] } }, OUT).ok, false);
+  assert.equal(buildPlotScript({ type: 'heatmap', data: { z: [[1]], x: ['a b'] } }, OUT).ok, false);
+  // 合法标签不受影响
+  assert.equal(buildPlotScript({ type: 'pie', data: { y: [1, 2], labels: ['甲', '乙'] } }, OUT).ok, true);
+});
+
+test('回归：Windows 保留设备名与 OUTDIR 校验', () => {
+  for (const bad of ['CON', 'con.png', 'NUL', 'aux.svg', 'COM1', 'lpt3.pdf']) {
+    assert.equal(buildPlotScript({ type: 'line', name: bad, data: { y: [1] } }, OUT).ok, false, `name=${bad} 应被拒`);
+  }
+  assert.equal(buildPlotScript({ type: 'line', name: 'console', data: { y: [1] } }, OUT).ok, true);
+  assert.equal(resolveOutDir({ MATLAB_MATE_OUTDIR: 'C:/a\nb' }, '/fb').ok, false);
+  assert.equal(resolveOutDir({ MATLAB_MATE_OUTDIR: 42 }, '/fb').value, '/fb'); // 非字符串回落
+  assert.equal(resolveOutDir({ MATLAB_MATE_OUTDIR: 'D:/ok' }, '/fb').value, 'D:/ok');
+});
+
+test('回归：writeScript 的替换串语义（$& 不被吞）', () => {
+  const evilOut = `${OUT}$&`;
+  const built = buildPlotScript({ type: 'line', name: 'dollar', data: { y: [1] } }, evilOut);
+  const p = scriptPathFor(evilOut, 'dollar');
+  const selfPath = p.replace(/\\/g, '/').replace(/'/g, "''");
+  const code = built.value.code.replace(/%SELF_PATH%/g, () => selfPath);
+  assert.match(code, new RegExp(`checkcode\\('${selfPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'\\)`));
+});
+
 test('回归：会话超时不杀会话（放弃本作业，后续调用仍走会话）', async () => {
   process.env.FAKE_MATLAB_IDLE_MS = '120000';
   process.env.FAKE_MATLAB_SLEEP_MS = '2500';
@@ -324,7 +411,7 @@ test('回归：内联数字总量与字符串单项上限', () => {
   assert.equal(buildPlotScript({ type: 'line', legend: ['a'.repeat(501)], data: { y: [1] } }, OUT).ok, false);
 });
 
-test('回归：csv 数据入口端到端（真实临时文件）', () => {
+test('回归：csv 数据入口端到端（真实临时文件）', async () => {
   const csvPath = join(mkdtempSync(join(tmpdir(), 'mp-csv-')), 'data.csv');
   writeFileSync(csvPath, '1,2\n2,4\n3,9\n');
   const built = buildPlotScript({ type: 'line', name: 'csv-line', data: { csv: csvPath } }, OUT);
@@ -332,7 +419,7 @@ test('回归：csv 数据入口端到端（真实临时文件）', () => {
   assert.match(built.value.code, /readmatrix\(/);
   const scriptPath = scriptPathFor(OUT, 'csv-line');
   writeFileSync(scriptPath, built.value.code, 'utf8');
-  const run = runScript(scriptPath, {});
+  const run = await runScript(scriptPath, {});
   assert.equal(run.result?.ok, true, JSON.stringify(run));
   assert.equal(existsSync(built.value.outFile), true);
   const fig = readFigure(OUT, 'csv-line.png');
@@ -359,12 +446,12 @@ test('classifyMatlabError 覆盖六大类', () => {
 });
 
 // ---------- fake 缝端到端 ----------
-test('fake 缝：line 图生成→落盘→读回', () => {
+test('fake 缝：line 图生成→落盘→读回', async () => {
   const built = buildPlotScript({ type: 'line', name: 'unit-line', data: { x: [1, 2, 3], y: [[1, 2, 3]] } }, OUT);
   assert.equal(built.ok, true, built.reason);
   const scriptPath = scriptPathFor(OUT, 'unit-line');
   writeFileSync(scriptPath, built.value.code, 'utf8');
-  const run = runScript(scriptPath, {});
+  const run = await runScript(scriptPath, {});
   assert.equal(run.result?.ok, true, JSON.stringify(run));
   assert.equal(existsSync(built.value.outFile), true);
   const fig = readFigure(OUT, 'unit-line.png');
@@ -373,34 +460,34 @@ test('fake 缝：line 图生成→落盘→读回', () => {
   assert.ok(fig.data.length > 100);
 });
 
-test('fake 缝：surf svg 导出', () => {
+test('fake 缝：surf svg 导出', async () => {
   const built = buildPlotScript({ type: 'surf', name: 'unit-surf', format: 'svg', data: { z: [[1, 2], [3, 4]] } }, OUT);
   assert.equal(built.ok, true, built.reason);
   const scriptPath = scriptPathFor(OUT, 'unit-surf');
   writeFileSync(scriptPath, built.value.code, 'utf8');
-  runScript(scriptPath, {});
+  await runScript(scriptPath, {});
   assert.equal(existsSync(built.value.outFile), true);
   const fig = readFigure(OUT, 'unit-surf.svg');
   assert.equal(fig.mimeType, 'image/svg+xml');
 });
 
-test('fake 缝：FAKE_MATLAB_FAIL 时返回结构化错误', () => {
+test('fake 缝：FAKE_MATLAB_FAIL 时返回结构化错误', async () => {
   process.env.FAKE_MATLAB_FAIL = '1';
   const built = buildPlotScript({ type: 'line', name: 'unit-fail', data: { y: [1] } }, OUT);
   const scriptPath = scriptPathFor(OUT, 'unit-fail');
   writeFileSync(scriptPath, built.value.code, 'utf8');
-  const run = runScript(scriptPath, {});
+  const run = await runScript(scriptPath, {});
   delete process.env.FAKE_MATLAB_FAIL;
   assert.equal(run.exitCode, 1);
   assert.equal(run.result?.ok, false);
 });
 
-test('fake 缝：超时被捕获', () => {
+test('fake 缝：超时被捕获', async () => {
   process.env.FAKE_MATLAB_SLEEP_MS = '3000';
   const built = buildPlotScript({ type: 'line', name: 'unit-slow', data: { y: [1] } }, OUT);
   const scriptPath = scriptPathFor(OUT, 'unit-slow');
   writeFileSync(scriptPath, built.value.code, 'utf8');
-  const run = runScript(scriptPath, { timeoutMs: 500 });
+  const run = await runScript(scriptPath, { timeoutMs: 500 });
   delete process.env.FAKE_MATLAB_SLEEP_MS;
   assert.equal(run.timedOut, true);
   assert.equal(run.error, 'timeout');
@@ -416,7 +503,7 @@ test('figures：列清单 + 非法名拒绝', () => {
 
 test('fake 缝：matlab_env 探测', async () => {
   const { matlabEnv } = await import('./lib.mjs');
-  const env = matlabEnv({ timeoutMs: 10000 });
+  const env = await matlabEnv({ timeoutMs: 10000 });
   assert.equal(env.available, true);
   assert.equal(env.release, 'R2023b');
   assert.ok(env.toolboxes.includes('MATLAB'));

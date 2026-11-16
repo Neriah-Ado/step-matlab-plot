@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * step-matlab-plot MCP server v1.0.0（stdio JSON-RPC，零依赖；协议与 @modelcontextprotocol/sdk 兼容）。
+ * step-matlab-plot MCP server v1.0.2（stdio JSON-RPC，零依赖；协议与 @modelcontextprotocol/sdk 兼容）。
  * 工具：matlab_env / matlab_plot_types / matlab_plot / matlab_plot_many / matlab_run / matlab_figure_ls / matlab_figure_read。
  * 安全：matlab_run 默认 dry-run，confirm=true 才执行（G3）；图表名/路径白名单（C-05）；
  *       长输出尾截断（C5）；MATLAB 缺失给安装指引。
@@ -14,11 +14,14 @@ import {
   PLOT_TYPES, buildPlotScript, validateSpec,
   INSTALL_GUIDANCE, matlabEnv, runScript, execScript, cleanupSidecars, readSidecar, classifyMatlabError,
   ensureDir, scriptPathFor, listFigures, readFigure,
-  resolveOutDir, isConfirmed, MAX_CODE_CHARS, resetSessions,
+  resolveOutDir, isConfirmed, MAX_CODE_CHARS, resetSessions, stopAllSessionsSync,
+  assertFigureName,
 } from './lib.mjs';
 const PLUGIN_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 const VERSION = JSON.parse(readFileSync(join(PLUGIN_DIR, 'step.plugin.json'), 'utf8')).version;
 const DEFAULT_OUTDIR = join(PLUGIN_DIR, 'figures');
+const MAX_BATCH_CODE_CHARS = 8000000;   // 批量生成代码聚合上限（8MB）
+const DRYRUN_CODE_MAX = 50000;          // dryRun 回传代码截断阈值
 
 function outDirOrGuidance() {
   const r = resolveOutDir(process.env, DEFAULT_OUTDIR);
@@ -35,21 +38,33 @@ function tailLines(text, max = 200) {
 }
 
 // 防覆盖：已存在且未声明 overwrite 时自动追加 -2/-3…
-// taken：本批次已占用的名字（批内同名也要去重，否则后写的脚本会覆盖先写的）
+// taken：本批次已占用的名字（批内同名也要去重，否则后写的脚本会覆盖先写的）。
+// 探测优先：先用 existsSync/白名单找到可用名，最后只构建一次——避免同名冲突时
+// 99 次全量重建（实测 200k 点 spec 最坏 ~1.1s → ~12ms）。
 function uniqueBuild(spec, outDir, taken = null) {
-  let attempt = spec;
+  const base = typeof spec?.name === 'string' && spec.name.trim() ? spec.name.trim() : 'figure';
+  const fmt = (typeof spec?.format === 'string' && spec.format.trim() ? spec.format.trim().toLowerCase() : 'png');
+  let chosen = null;
   for (let i = 1; i <= 99; i++) {
-    const built = buildPlotScript(attempt, outDir);
-    if (!built.ok) return built;
-    const clash = taken ? taken.has(built.value.name) : false;
-    // overwrite 只放开"输出文件"复用；脚本路径仍须唯一（批内同名不能共享 .m）
-    if ((!existsSync(built.value.outFile) && !clash) || (spec.overwrite === true && !clash)) {
-      if (taken) taken.add(built.value.name);
-      return built;
+    const candidate = i === 1 ? base : `${base}-${i}`;
+    const nameCheck = assertFigureName(candidate, fmt);
+    if (!nameCheck.ok) break; // 候选名非法（如超长）→ 交给最终 build 报错
+    const finalName = nameCheck.value;
+    const clash = taken ? taken.has(finalName) : false;
+    const outFile = `${outDir.replace(/\\/g, '/')}/${finalName}.${fmt}`;
+    if ((!existsSync(outFile) && !clash) || (spec.overwrite === true && !clash)) {
+      chosen = { ...spec, name: finalName };
+      break;
     }
-    attempt = { ...spec, name: `${spec.name ?? 'figure'}-${i + 1}` };
   }
-  return { ok: false, reason: '输出文件名冲突次数过多' };
+  const built = buildPlotScript(chosen ?? { ...spec, name: base }, outDir);
+  if (!built.ok) return built;
+  if (!chosen && spec.overwrite !== true) {
+    // 99 个候选名全被占用：显式报错，绝不静默覆盖
+    return { ok: false, reason: `输出文件名 ${base} 及 ${base}-2…${base}-99 均已存在；请改名或显式 overwrite: true` };
+  }
+  if (taken) taken.add(built.value.name);
+  return built;
 }
 
 const TOOLS = [
@@ -105,10 +120,11 @@ const TOOLS = [
 ];
 
 /** 写脚本并把 %SELF_PATH% 占位符替换为真实路径（供 checkcode 自检与 sidecar 使用）。
- *  路径同样做单引号成倍转义——outDir 可含引号时未转义会构成 MATLAB 注入。 */
+ *  路径做单引号成倍转义——outDir 可含引号时未转义会构成 MATLAB 注入；
+ *  用函数作替换串——字符串替换串里的 $&/$'/$$ 会被特殊语义吞掉。 */
 function writeScript(scriptPath, code) {
   const selfPath = scriptPath.replace(/\\/g, '/').replace(/'/g, "''");
-  writeFileSync(scriptPath, code.replace(/%SELF_PATH%/g, selfPath), 'utf8');
+  writeFileSync(scriptPath, code.replace(/%SELF_PATH%/g, () => selfPath), 'utf8');
 }
 
 async function handlePlot(args) {
@@ -118,10 +134,11 @@ async function handlePlot(args) {
   if (!built.ok) return { error: 'invalid-spec', reason: built.reason };
   const { code, outFile, name, format, type } = built.value;
   if (args?.dryRun === true) {
-    return { dryRun: true, type, name, format, outFile, code, warnings: built.value.warnings ?? [] };
+    return { dryRun: true, type, name, format, outFile, code: truncateCode(code), codeLength: code.length, codeTruncated: code.length > DRYRUN_CODE_MAX, warnings: built.value.warnings ?? [] };
   }
   const scriptPath = scriptPathFor(out.dir, name);
   writeScript(scriptPath, code);
+  const startedAt = Date.now();
   const run = await execScript(scriptPath, { outDir: out.dir });
   if (run.error === 'matlab-not-found') return { error: 'matlab-not-found', guidance: run.guidance };
   if (run.timedOut) return { error: 'timeout', name, format, outFile, message: run.message, script: scriptPath };
@@ -135,10 +152,15 @@ async function handlePlot(args) {
     return { error: 'no-output', name, format, outFile, mode: run.mode, pattern: cls.id, cause: cls.cause, action: cls.action, stderr: tailLines(run.stderr, 50).lines, script: scriptPath };
   }
   const st = statSync(outFile);
+  // 产物新鲜度：文件必须是本次执行写入的（mtime 不早于开始时刻）。
+  // 否则预置的同名文件会让"无 RESULT 的异常协议路径"被报成 ok:true（假成功）。
+  if (st.mtimeMs < startedAt - 2000 && res?.ok !== true) {
+    return { error: 'stale-output', name, format, outFile, mode: run.mode, reason: '输出文件未被本次执行更新（可能是预置文件）；请检查 MATLAB 执行结果', script: scriptPath };
+  }
   return { ok: true, type, name, format, file: outFile, bytes: st.size, mode: run.mode, analyzer: res?.analyzer ?? null, warnings: built.value.warnings ?? [], script: scriptPath };
 }
 
-function handleRun(args) {
+async function handleRun(args) {
   const out = outDirOrGuidance();
   if (out.error) return out;
   const code = typeof args?.code === 'string' ? args.code : '';
@@ -150,7 +172,7 @@ function handleRun(args) {
   }
   const scriptPath = scriptPathFor(out.dir, `run-${Date.now().toString(36)}`);
   writeFileSync(scriptPath, code, 'utf8');
-  const run = runScript(scriptPath, { timeoutMs: args?.timeoutMs });
+  const run = await runScript(scriptPath, { timeoutMs: args?.timeoutMs });
   if (run.error === 'matlab-not-found') return { error: 'matlab-not-found', guidance: run.guidance };
   if (run.timedOut) return { error: 'timeout', script: scriptPath, message: run.message };
   const stdout = tailLines(run.stdout, 200);
@@ -172,13 +194,19 @@ async function handlePlotMany(args) {
   if (specs.length > 20) return { error: 'too-many-specs', reason: '单批最多 20 张图' };
   const built = [];
   const taken = new Set();
+  let totalCodeChars = 0;
   for (let i = 0; i < specs.length; i++) {
     const b = uniqueBuild(specs[i], out.dir, taken);
     if (!b.ok) return { error: 'invalid-spec', index: i, reason: b.reason };
+    totalCodeChars += b.value.code.length;
+    // 边生成边判定：超限立即返回，避免为超大批付完全部构建成本
+    if (totalCodeChars > MAX_BATCH_CODE_CHARS) {
+      return { error: 'batch-too-large', index: i, reason: `批量生成代码合计已超 ${MAX_BATCH_CODE_CHARS} 字符（第 ${i + 1} 张后 ${totalCodeChars}）；请分批调用` };
+    }
     built.push(b.value);
   }
   if (args?.dryRun === true) {
-    return { dryRun: true, figures: built.map((b) => ({ name: b.name, type: b.type, format: b.format, outFile: b.outFile, code: b.code, warnings: b.warnings ?? [] })) };
+    return { dryRun: true, figures: built.map((b) => ({ name: b.name, type: b.type, format: b.format, outFile: b.outFile, code: truncateCode(b.code), warnings: b.warnings ?? [] })) };
   }
   // 逐图写脚本（%SELF_PATH% 已替换），再合并为一次执行
   const scriptPaths = built.map((b) => {
@@ -193,36 +221,57 @@ async function handlePlotMany(args) {
   writeScript(combinedPath, combined);
   const run = await execScript(combinedPath, { outDir: out.dir });
   if (run.error === 'matlab-not-found') return { error: 'matlab-not-found', guidance: run.guidance };
-  if (run.timedOut) return { error: 'timeout', message: run.message, script: combinedPath };
+  // 逐图 sidecar 兜底：RESULT 行丢失时（如 daemon 输出缓冲）仍能拿到每图结果；
+  // 超时路径也走同一汇总——已落盘的图照常汇报，不丢结果
+  const collected = collectFigures(built, scriptPaths, run);
+  cleanupSidecars(scriptPaths);
+  if (run.timedOut) {
+    return { mode: run.mode, error: 'timeout', message: run.message, figures: collected.figures, okCount: collected.okCount, total: collected.total };
+  }
+  const { figures, okCount, total } = collected;
+  return { mode: run.mode, figures, okCount: figures.filter((f) => f.ok).length, total: figures.length };
+}
 
-  // 逐图 sidecar 兜底：RESULT 行丢失时（如 daemon 输出缓冲）仍能拿到每图结果
+/** dryRun 代码截断：避免回传数 MB 代码（与 matlab_run 的 20 万字符上限对齐） */
+function truncateCode(code) {
+  if (code.length <= DRYRUN_CODE_MAX) return code;
+  return `${code.slice(0, DRYRUN_CODE_MAX)}\n...[代码过长已截断，共 ${code.length} 字符；正式调用将完整执行]`;
+}
+
+/** 汇总逐图结果：RESULT 行 → sidecar 兜底 → 文件存在性；失败图带诊断与定位信息 */
+function collectFigures(built, scriptPaths, run) {
   const sidecarResults = new Map();
-  for (const p of scriptPaths) {
+  for (const p of scriptPaths ?? []) {
     const sc = readSidecar(p);
     if (sc?.name) sidecarResults.set(sc.name, sc);
   }
-  cleanupSidecars(scriptPaths);
   const jobError = run.result?.error ?? run.matlabError ?? null;
   const figures = [];
-  for (const b of built) {
+  built.forEach((b, bi) => {
     const res = (run.results ?? []).find((r) => r && r.name === b.name) ?? sidecarResults.get(b.name) ?? null;
+    const script = scriptPaths?.[bi] ?? null;
     if (res && res.ok === false) {
       const cls = classifyMatlabError(res.error ?? '');
-      figures.push({ name: b.name, type: b.type, error: 'matlab-error', pattern: cls.id, cause: cls.cause, action: cls.action, matlabError: res.error });
-      continue;
+      figures.push({
+        name: b.name, type: b.type, error: 'matlab-error',
+        pattern: cls.id, cause: cls.cause, action: cls.action,
+        matlabError: res.error, identifier: res.identifier ?? null,
+        script, outFile: b.outFile,
+      });
+      return;
     }
     if (!existsSync(b.outFile)) {
       // 无逐图 RESULT：用作业级错误回填诊断，避免只给裸 no-output
       const cls = jobError ? classifyMatlabError(jobError) : null;
       figures.push({
-        name: b.name, type: b.type, error: 'no-output', outFile: b.outFile,
+        name: b.name, type: b.type, error: 'no-output', outFile: b.outFile, script,
         ...(cls ? { pattern: cls.id, cause: cls.cause, action: cls.action, matlabError: jobError } : {}),
       });
-      continue;
+      return;
     }
     figures.push({ name: b.name, type: b.type, ok: true, file: b.outFile, bytes: statSync(b.outFile).size, analyzer: res?.analyzer ?? null, warnings: b.warnings ?? [] });
-  }
-  return { mode: run.mode, figures, okCount: figures.filter((f) => f.ok).length, total: figures.length };
+  });
+  return { figures, okCount: figures.filter((f) => f.ok).length, total: figures.length };
 }
 
 async function handleCall(name, args) {
@@ -274,7 +323,7 @@ const gracefulShutdown = () => {
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, gracefulShutdown);
 }
-process.on('exit', () => { resetSessions(); });
+process.on('exit', () => { stopAllSessionsSync(); });
 // stdin EOF（host 关闭管道）时主动退出：会话 daemon 的管道句会拉住事件循环
 rl.on('close', gracefulShutdown);
 
@@ -319,20 +368,13 @@ rl.on('line', async (line) => {
       return;
     }
     if (result?.image) {
-      send({ jsonrpc: '2.0', id, result: {
-        content: [
-          { type: 'image', data: result.image.data, mimeType: result.image.mimeType },
-          { type: 'text', text: result.text },
-        ],
-        structuredContent: {
-          file: result.image.file, format: result.image.mimeType, bytes: result.image.bytes,
-          ...(result.image.width ? { width: result.image.width } : {}),
-          ...(result.image.height ? { height: result.image.height } : {}),
-        },
-      } });
+      // 手工拼 JSON：base64 字符集 [A-Za-z0-9+/=] 与固定 mimeType 无需转义，
+      // 省掉 JSON.stringify 对 35MB 串的整份复制（峰值内存 ~95MB → ~60MB）
+      const img = result.image;
+      const dim = img.width ? `,"width":${img.width},"height":${img.height}` : '';
+      process.stdout.write(`{"jsonrpc":"2.0","id":${JSON.stringify(id)},"result":{"content":[{"type":"image","data":"${img.data}","mimeType":"${img.mimeType}"},{"type":"text","text":${JSON.stringify(result.text)}}],"structuredContent":{"file":${JSON.stringify(img.file)},"format":"${img.mimeType}","bytes":${img.bytes}${dim}}}}\n`);
       return;
-    }
-    send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], structuredContent: result } });
+    }    send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], structuredContent: result } });
     return;
   }
   send({ jsonrpc: '2.0', id: id ?? null, error: { code: -32601, message: `Method not found: ${method}` } });

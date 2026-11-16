@@ -10,7 +10,7 @@ export {
   ensureDir, scriptDir, scriptPathFor, listFigures, readFigure, mimeFor,
 } from './figures.mjs';
 export {
-  execInSession, stopSession, sessionStatus, resetSessions,
+  execInSession, stopSession, sessionStatus, resetSessions, stopAllSessionsSync,
 } from './session.mjs';
 export {
   FILE_NAME_RE, PLOT_FORMATS, MAX_SERIES_POINTS, MAX_CODE_CHARS,

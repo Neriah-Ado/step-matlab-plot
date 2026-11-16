@@ -90,6 +90,7 @@ description: MATLAB 画图方法论：结构化规格生成出版级图表、任
 - 无 MATLAB 环境（CI/验收）：设 `MATLAB_MATE_FAKE=<插件目录>/server/fake-matlab.mjs` 走测试缝（含 daemon 协议模拟），端到端仍可验证（图片为占位图）。
 - 中文 Windows 上 MATLAB 按 GBK 输出，exec 层已做 UTF-8→GBK 回退解码；图表内中文由 MATLAB 字体决定，缺字形时改用英文标签。
 - 超时：默认 300 s（冷启动 20-90 s，会话模式下仅首次），`timeoutMs` 最大 600 s；长输出只回传尾部 200 行。
+- **信任边界**：`figures/.session/`（queue/results/scripts）属本地信任边界——对该目录有写权限等同本机代码执行（daemon 会执行其中 job 代码）。多用户/不受信进程可写的输出目录请设 `MATLAB_MATE_SESSION=never`。
 - **结果字段**：`mode`（session/oneshot）、`analyzer`（Code Analyzer 问题计数，执行前预检）、`bytes`（产物字节数）、`warnings`（被忽略的样式属性）。
 
 ## 与视觉验证闭环

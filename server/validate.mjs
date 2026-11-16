@@ -7,6 +7,8 @@ import { existsSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 
 export const FILE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+// Windows 保留设备名（大小写不敏感，带任意扩展名均保留）
+const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 export const PLOT_FORMATS = ['png', 'pdf', 'svg', 'jpg', 'fig'];
 export const MAX_SERIES_POINTS = 200000;   // 单系列点数上限，超出引导用 CSV/降采样
 export const MAX_SERIES_COUNT = 64;
@@ -27,6 +29,12 @@ export function assertFigureName(name, format) {
   if (value.toLowerCase().endsWith(suffix)) value = value.slice(0, -suffix.length);
   if (!FILE_NAME_RE.test(value)) {
     return fail('图表名仅允许 [A-Za-z0-9][A-Za-z0-9_.-]{0,127}，不能以 - 开头、不能含路径分隔符或 ..');
+  }
+  // Windows 保留设备名对任意扩展名有效（aux.svg 也是 AUX 设备），剥掉扩展名再查；
+  // 多段点名（nul.a.b）取首段一并检查
+  const stem = value.replace(/\.[^.]*$/, '');
+  if (WIN_RESERVED.test(stem) || WIN_RESERVED.test(stem.split('.')[0])) {
+    return fail(`图表名不能使用 Windows 保留设备名：${value}`);
   }
   return ok(value);
 }
@@ -77,13 +85,14 @@ export function toNumMatrix(v, what = 'data') {
   return ok(rows);
 }
 
-/** 字符串数组（标签/图例） */
+/** 字符串数组（标签/图例）：与 validateText 同一套控制字符标准 */
 export function toStrVector(v, what = 'labels') {
   if (!isPlainArray(v) || v.length === 0) return fail(`${what} 必须是非空字符串数组`);
   if (v.length > 4096) return fail(`${what} 最多 4096 项`);
   for (let i = 0; i < v.length; i++) {
     if (typeof v[i] !== 'string') return fail(`${what}[${i}] 必须是字符串`);
     if (v[i].length > MAX_STR_ITEM) return fail(`${what}[${i}] 超过 ${MAX_STR_ITEM} 字符上限`);
+    if (HAS_CONTROL_CHARS(v[i])) return fail(`${what}[${i}] 含有控制字符（换行/制表符等）`);
   }
   return ok(v);
 }
@@ -109,10 +118,13 @@ export function resolveDataFile(p, cwd = process.cwd()) {
   return ok(abs);
 }
 
-/** 输出目录：MATLAB_MATE_OUTDIR 必须为绝对路径，否则回落插件内 figures/ */
+const HAS_CONTROL_CHARS = (s) => /[\r\n\t\u0000-\u001f]/.test(s);
+
+/** 输出目录：MATLAB_MATE_OUTDIR 必须为绝对路径且无控制字符，否则回落插件内 figures/ */
 export function resolveOutDir(env = process.env, fallback) {
   const raw = env.MATLAB_MATE_OUTDIR;
-  if (raw && raw.trim()) {
+  if (typeof raw === 'string' && raw.trim()) {
+    if (HAS_CONTROL_CHARS(raw)) return fail('MATLAB_MATE_OUTDIR 含有控制字符');
     if (!isAbsolute(raw.trim())) return fail('MATLAB_MATE_OUTDIR 必须是绝对路径');
     return ok(raw.trim());
   }

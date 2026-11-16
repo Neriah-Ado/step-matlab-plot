@@ -105,7 +105,7 @@ writeFileSync(scriptPath, built.value.code, 'utf8');
 console.log(`[real-check] 类型=${type} 脚本=${scriptPath}`);
 console.log(`[real-check] 调用真实 MATLAB（冷启动可能 30-90s）…`);
 
-const run = runScript(scriptPath, { timeoutMs: 300000 });
+const run = await runScript(scriptPath, { timeoutMs: 300000 });
 console.log('[real-check] exitCode =', run.exitCode, ' timedOut =', run.timedOut);
 if (run.result) console.log('[real-check] RESULT =', JSON.stringify(run.result));
 if (run.stderr?.trim()) console.log('[real-check] stderr 尾部 =', run.stderr.trim().slice(-400));

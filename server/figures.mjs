@@ -68,10 +68,17 @@ export function readFigure(outDir, name) {
   }
   const abs = join(outDir, file);
   if (!existsSync(abs)) return { error: 'not-found', reason: `图表不存在：${file}` };
-  const lst = lstatSync(abs);
-  // 符号链接可指向输出目录外的任意文件，拒绝
-  if (lst.isSymbolicLink()) return { error: 'symlink-rejected', reason: '拒绝读取符号链接（可指向目录外文件）' };
-  const st = statSync(abs);
+  // TOCTOU 防护：lstat→stat→read 全链 try/catch，任一环节文件消失/被换链都不抛
+  let lst;
+  let st;
+  try {
+    lst = lstatSync(abs);
+    // 符号链接可指向输出目录外的任意文件，拒绝
+    if (lst.isSymbolicLink()) return { error: 'symlink-rejected', reason: '拒绝读取符号链接（可指向目录外文件）' };
+    st = statSync(abs);
+  } catch {
+    return { error: 'not-found', reason: `图表不存在或已变化：${file}` };
+  }
   if (!st.isFile()) return { error: 'not-a-file', reason: `不是普通文件：${file}` };
   if (st.size > MAX_FIGURE_READ_BYTES) {
     return { error: 'too-large', reason: `图表超过 ${MAX_FIGURE_READ_BYTES / 1048576}MB，请先压缩` };

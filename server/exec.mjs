@@ -2,7 +2,7 @@
  * step-matlab-plot 执行层：定位 MATLAB 可执行文件、以 -batch 方式执行脚本、
  * 解析 RESULT 回传行、错误分类。测试缝：MATLAB_MATE_FAKE 指向 node 脚本。
  */
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { execInSession, stopSession, sessionStatus } from './session.mjs';
@@ -40,8 +40,6 @@ export function resolveMatlabBin(env = process.env) {
   return { available: true, bin: isWin ? 'matlab.exe' : 'matlab' };
 }
 
-function isTimedOut(r) { return r.error?.code === 'ETIMEDOUT' || r.signal === 'SIGTERM'; }
-
 /** 中文 Windows 上 MATLAB 按 GBK 输出：UTF-8 解码出现替换字符时回退 GBK */
 function decodeBuf(buf) {
   if (!buf || buf.length === 0) return '';
@@ -50,28 +48,53 @@ function decodeBuf(buf) {
   try { return new TextDecoder('gbk').decode(buf); } catch { return s; }
 }
 
-function runOnce(bin, args, { timeoutMs = 300000, env } = {}) {
-  if (env.MATLAB_MATE_FAKE) {
-    const r = spawnSync(process.execPath, [env.MATLAB_MATE_FAKE, ...args], { encoding: 'utf8', timeout: timeoutMs, env: { ...process.env, ...env } });
-    return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '', timedOut: isTimedOut(r), missing: Boolean(r.error) && r.status === null && !isTimedOut(r) };
-  }
-  const r = spawnSync(bin, args, { encoding: 'buffer', timeout: timeoutMs, shell: false });
-  const timedOut = isTimedOut(r);
-  const missing = (r.error?.code === 'ENOENT') || (r.status === null && !timedOut);
-  return { code: r.status, stdout: decodeBuf(r.stdout), stderr: decodeBuf(r.stderr), timedOut, missing };
+/** 异步执行一次性命令（spawn + 超时）。
+ *  替代 spawnSync：同步版会冻结 server 事件循环——>90s 的执行会让
+ *  server-alive 看门狗停止刷新，导致持久会话被误杀（实测复现）。 */
+function runOnceAsync(bin, args, { timeoutMs = 300000, env } = {}) {
+  return new Promise((resolveP) => {
+    const child = spawn(bin, args, { shell: false, env: env.MATLAB_MATE_FAKE ? { ...process.env, ...env } : process.env });
+    const outChunks = [];
+    const errChunks = [];
+    let settled = false;
+    const done = (payload) => { if (!settled) { settled = true; clearTimeout(timer); resolveP(payload); } };
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* 忽略 */ }
+      done({ code: null, stdout: Buffer.concat(outChunks), stderr: Buffer.concat(errChunks), timedOut: true, missing: false });
+    }, Math.max(1000, timeoutMs));
+    child.stdout?.on('data', (d) => outChunks.push(d));
+    child.stderr?.on('data', (d) => errChunks.push(d));
+    child.on('error', (err) => done({ code: null, stdout: Buffer.alloc(0), stderr: Buffer.from(String(err?.message ?? err)), timedOut: false, missing: err?.code === 'ENOENT' }));
+    child.on('close', (code, signal) => {
+      const timedOut = signal === 'SIGTERM' || signal === 'SIGKILL';
+      done({ code, stdout: Buffer.concat(outChunks), stderr: Buffer.concat(errChunks), timedOut, missing: code === null && !timedOut });
+    });
+  });
+}
+
+async function runOnce(bin, args, { timeoutMs = 300000, env } = {}) {
+  const fake = Boolean(env.MATLAB_MATE_FAKE);
+  const r = await runOnceAsync(fake ? process.execPath : bin, fake ? [env.MATLAB_MATE_FAKE, ...args] : args, { timeoutMs, env });
+  return {
+    code: r.code,
+    stdout: fake ? r.stdout.toString('utf8') : decodeBuf(r.stdout),
+    stderr: fake ? r.stderr.toString('utf8') : decodeBuf(r.stderr),
+    timedOut: r.timedOut,
+    missing: r.missing,
+  };
 }
 
 /** 执行 .m 脚本：优先 -batch（R2019a+），CLI 不支持时回退 -nodisplay -nosplash -r */
-export function runScript(scriptPath, { timeoutMs = 300000, env = process.env } = {}) {
+export async function runScript(scriptPath, { timeoutMs = 300000, env = process.env } = {}) {
   const bin = resolveMatlabBin(env);
-  if (!bin.available) return { error: 'matlab-not-found', guidance: INSTALL_GUIDANCE };
+  if (!bin.available) return { error: 'matlab-not-found', guidance: bin.guidance ?? INSTALL_GUIDANCE };
   const cap = Math.max(1000, Math.min(Math.floor(Number(timeoutMs) || 300000), 600000));
   // -batch 的参数是 MATLAB 语句：路径必须经 run() 执行，直接传路径会被当成表达式求值而报错
   const stmt = `run('${String(scriptPath).replace(/\\/g, '/').replace(/'/g, "''")}')`;
-  let r = runOnce(bin.bin, ['-batch', stmt], { timeoutMs: cap, env });
+  let r = await runOnce(bin.bin, ['-batch', stmt], { timeoutMs: cap, env });
   if (r.missing) return { error: 'matlab-not-found', guidance: INSTALL_GUIDANCE, stderr: r.stderr };
   if (r.code !== 0 && /unrecognized|not recognized|invalid option/i.test(`${r.stdout}\n${r.stderr}`)) {
-    r = runOnce(bin.bin, ['-nodisplay', '-nosplash', '-r', `${stmt}; exit;`], { timeoutMs: cap, env });
+    r = await runOnce(bin.bin, ['-nodisplay', '-nosplash', '-r', `${stmt}; exit;`], { timeoutMs: cap, env });
   }
   const result = parseResultLine(r.stdout);
   return {
@@ -138,8 +161,10 @@ export function cleanupSidecars(scriptPaths) {
 export async function execScript(scriptPath, { outDir, timeoutMs = 300000, env = process.env } = {}) {
   const stmt = `run('${String(scriptPath).replace(/\\/g, '/').replace(/'/g, "''")}');`;
   const forced = env.MATLAB_MATE_SESSION === 'always';
+  // 投递/执行前清理陈旧 sidecar：上次执行的残留会让本次失败被报成假成功
+  try { unlinkSync(`${scriptPath}.result.json`); } catch { /* 忽略 */ }
   if (outDir) {
-    const s = await execInSession(outDir, stmt, { timeoutMs, env });
+    const s = await execInSession(outDir, stmt, { timeoutMs, env, scriptPath });
     if (s && s.timeout) {
       return { mode: 'session', error: 'timeout', timedOut: true, message: s.message };
     }
@@ -174,7 +199,7 @@ export async function execScript(scriptPath, { outDir, timeoutMs = 300000, env =
     }
     // sessionDied：回退一次性模式（下面）
   }
-  const r = runScript(scriptPath, { timeoutMs, env });
+  const r = await runScript(scriptPath, { timeoutMs, env });
   return { mode: 'oneshot', ...r, result: r.result ?? readSidecar(scriptPath), results: parseAllResultLines(r.stdout ?? '') };
 }
 
@@ -184,9 +209,9 @@ export function classifyMatlabError(text) {
   const patterns = [
     { id: 'license', match: /license|licensing|not licensed|seat|许可/i.test(t), cause: 'MATLAB 许可证缺失/不足或未激活', action: '检查 license（lmstat / 激活客户端）；工具箱需对应 license' },
     { id: 'toolbox-missing', match: /Undefined function|unrecognized function or variable|requires .*Toolbox|has no .* package|无法识别的函数|函数或变量.*无法识别/i.test(t), cause: '缺少 MATLAB 工具箱或函数名拼写错误', action: '安装对应 Toolbox，或换用基础函数实现' },
-    { id: 'invalid-input', match: /Invalid (argument|parameter|input)|Dimensions of matrices|Incompatible dimensions|too many input arguments|维度|不一致|数目|无效|必须|索引|下标|大小|边界/i.test(t), cause: '数据/参数与图形不匹配（维度或取值）', action: '核对 spec.data 维度：x/y 等长、z 为矩阵、多序列用二维数组' },
+    { id: 'invalid-input', match: /Invalid (argument|parameter|input)|Dimensions of matrices|Incompatible dimensions|too many input arguments|维度|不一致|数目|无效|必须|索引|下标|大小|边界|无法从.*转换|Cannot convert|Conversion to/i.test(t), cause: '数据/参数与图形不匹配（维度或取值）', action: '核对 spec.data 维度：x/y 等长、z 为矩阵、多序列用二维数组；data.json 的各系列须等长' },
     { id: 'out-of-memory', match: /Out of memory|内存不足/i.test(t), cause: '数据量过大导致内存不足', action: '降采样或改用 data.csv 分块；提高系列点数上限需谨慎' },
-    { id: 'cli-unsupported', match: /unrecognized|not recognized|invalid option|不支持/i.test(t), cause: '当前 MATLAB 不支持 -batch（R2019a 之前）', action: '已自动回退 -nodisplay -r 模式；如仍失败请升级 MATLAB' },
+    { id: 'cli-unsupported', match: /unrecognized|not recognized|invalid option|不支持\s*(-|batch|命令行|选项)/i.test(t), cause: '当前 MATLAB 不支持 -batch（R2019a 之前）', action: '已自动回退 -nodisplay -r 模式；如仍失败请升级 MATLAB' },
     { id: 'file-io', match: /Unable to (open|write|create)|Permission denied|No such file or directory|无法打开|无法写入/i.test(t), cause: '输出/输入文件不可写或不存在', action: '检查 figures 目录权限与 data.csv 路径' },
   ];
   return patterns.find((p) => p.match) ?? { id: 'matlab-error', cause: 'MATLAB 执行报错', action: '查看 stderr 末段定位；先用 dryRun 检查生成的代码' };
@@ -204,12 +229,12 @@ export function buildEnvProbe() {
 }
 
 /** 环境探测：版本 + 工具箱清单（真机约 20-60s） */
-export function matlabEnv({ timeoutMs = 180000, env = process.env } = {}) {
+export async function matlabEnv({ timeoutMs = 180000, env = process.env } = {}) {
   const bin = resolveMatlabBin(env);
-  if (!bin.available) return { available: false, guidance: INSTALL_GUIDANCE };
+  if (!bin.available) return { available: false, guidance: bin.guidance ?? INSTALL_GUIDANCE };
   const probe = buildEnvProbe();
   const cap = Math.max(5000, Math.min(Math.floor(Number(timeoutMs) || 180000), 600000));
-  const r = runOnce(bin.bin, ['-batch', probe], { timeoutMs: cap, env });
+  const r = await runOnce(bin.bin, ['-batch', probe], { timeoutMs: cap, env });
   if (r.missing) return { available: false, bin: bin.bin, guidance: INSTALL_GUIDANCE };
   if (r.timedOut) return { available: false, bin: bin.bin, error: 'timeout', message: `探测超时（${cap}ms）` };
   const result = parseResultLine(r.stdout);

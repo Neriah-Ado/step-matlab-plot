@@ -13,6 +13,40 @@ verify:
   - "会话相对一次性提速 ≥50%（实测 93.4%）"
   - "5+5+5 个子代理并行验证发现的问题全部修复并回归通过"
 versions:
+  - version: "1.0.2"
+    type: minor
+    theme: 会话稳健性与资源治理
+    status: done
+    notes: "15 个子代理三轮交叉验证（效率/稳定性/安全性）发现问题的修复：陈旧 server-alive/heartbeat、长作业误杀、代际误杀、慢启动看门狗、坏 job id 回填、cancel 协议、假成功防护（sidecar 清理+产物新鲜度）、控制字符/保留名/$&/TOCTOU、异步一次性执行、uniqueBuild 探测优先、批量聚合上限、dryRun 截断、图片响应手工序列化、轮询退避、clear variables、spool 清理、空闲回收 5min、信任边界文档。62 单测 + 17 冒烟 + 真机 X/Y/H/V 轮次全过"
+    tasks:
+      - id: MP-102-1
+        title: "会话判活：server-alive/heartbeat 陈旧处理、长作业阈值、代际保护、慢启动保护、单飞扩展"
+        done: true
+      - id: MP-102-2
+        title: "作业协议：坏 job id 回填、协议/执行分离、exitCode=0、cancel 文件"
+        done: true
+      - id: MP-102-3
+        title: "假成功防护：sidecar 投递前清理 + 产物 mtime 新鲜度校验"
+        done: true
+      - id: MP-102-4
+        title: "校验与安全：控制字符对齐、保留设备名、$& 替换、错误分类收紧、OUTDIR 校验、readFigure TOCTOU"
+        done: true
+      - id: MP-102-5
+        title: "效率：异步一次性执行、uniqueBuild 探测优先、批量聚合上限、dryRun 截断、图片手工序列化"
+        done: true
+      - id: MP-102-6
+        title: "资源治理：轮询退避、clear variables、spool TTL 清理、空闲回收 5min"
+        done: true
+      - id: MP-102-7
+        title: "文档：版本三元组、CHANGELOG 1.0.2、信任边界声明、测试数字 61/17"
+        done: true
+    acceptance:
+      - "62 单测 + 17 冒烟通过；真机 X/Y/H/V 轮次验证全过"
+      - "陈旧 sidecar/预置产物不再造成假成功"
+      - "长作业（>60s）不被并发调用误杀；坏 job 秒级失败"
+      - "一次性长执行不冻结 server 事件循环"
+    risks:
+      - "cancel 仅跳过排队作业，在途作业仍会跑完（队头阻塞上限=单作业超时）"
   - version: "1.0.0"
     type: major
     theme: 首次公开发布

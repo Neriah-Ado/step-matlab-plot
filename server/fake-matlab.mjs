@@ -12,7 +12,7 @@
  *   FAKE_MATLAB_SLEEP_MS=N  模拟耗时（用于超时测试）
  *   FAKE_MATLAB_IDLE_MS=N   daemon 空闲退出时间（默认 5000，测试用可缩短）
  */
-import { existsSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, readdirSync, statSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, unlinkSync, readdirSync, statSync, renameSync, writeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { makePng } from './png.mjs';
 
@@ -33,7 +33,8 @@ function parseRunPath(code) {
 }
 
 function emit(obj, exitCode = 0) {
-  process.stdout.write(`STEPCODE_MATLAB_RESULT:${JSON.stringify(obj)}\n`);
+  // 同步写 stdout：process.exit 不等管道 flush，异步 write 会丢输出
+  writeSync(1, `STEPCODE_MATLAB_RESULT:${JSON.stringify(obj)}\n`);
   process.exit(exitCode);
 }
 
@@ -65,14 +66,24 @@ function runDaemon(sessionDir, idleMsArg) {
       if (Date.now() - lastActive > idleMs) { clearInterval(timer); process.exit(0); }
       return;
     }
-    const jobName = jobs.sort()[0];
+    const jobName = jobs.sort((a, b) => statSync(join(queueDir, a)).mtimeMs - statSync(join(queueDir, b)).mtimeMs)[0];
     const jobPath = join(queueDir, jobName);
     let job = {};
-    try { job = JSON.parse(readFileSync(jobPath, 'utf8')); } catch { job = { id: '', code: '' }; }
+    let jobParseError = null;
+    try { job = JSON.parse(readFileSync(jobPath, 'utf8')); } catch (err) { jobParseError = err; }
+    // 与真机 daemon 契约一致：坏 job 用文件名 stem 回填 id，让调用方快速失败
+    const jobId = job.id ?? jobName.replace(/\.job$/, '');
     sleep(Number(process.env.FAKE_MATLAB_SLEEP_MS || 0));
     const stem = jobName.replace(/\.job$/, '');
     if (process.env.FAKE_MATLAB_FAIL === '1') {
-      writeResult(resultDir, stem, { id: job.id, ok: false, output: '', exitCode: 1, error: 'fake failure: 模拟 MATLAB 执行报错' });
+      writeResult(resultDir, stem, { id: jobId, ok: false, output: '', exitCode: 1, error: 'fake failure: 模拟 MATLAB 执行报错' });
+      try { unlinkSync(jobPath); } catch { /* 忽略 */ }
+      lastActive = Date.now();
+      return;
+    }
+    // 坏 job（JSON 解析失败）：与真机 daemon 一样快速失败并回填 id
+    if (jobParseError) {
+      writeResult(resultDir, stem, { id: jobId, ok: false, output: '', exitCode: 1, error: `fake failure: job-protocol: ${jobParseError.message}` });
       try { unlinkSync(jobPath); } catch { /* 忽略 */ }
       lastActive = Date.now();
       return;

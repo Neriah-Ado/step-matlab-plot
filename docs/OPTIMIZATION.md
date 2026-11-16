@@ -15,10 +15,10 @@
 实现（`server/session.mjs` + 生成的 `sessionDaemon.m`）：
 
 - **守护进程**：`matlab -batch "cd(...); sessionDaemon(...)"` 常驻；daemon 轮询 `<outDir>/.session/queue/*.job`，执行后写 `<outDir>/.session/results/<id>.res` 并删除 job。
-- **作业协议**：job = `{id, code}`；result = `{id, ok, output, exitCode, error}`，server 严格按 `id` 匹配（防串话/伪造冒领）。
+- **作业协议**：job = `{id, code}`；result = `{id, ok, output, exitCode, error}`，server 严格按 `id` 匹配（防串话/错 id 投毒）。
 - **健康检查**：heartbeat 双通道——daemon 循环顶部刷新 + 作业期间 MATLAB `timer` 每秒刷新（长作业不会被误判为死会话）。
 - **孤儿回收**：`server-alive` 看门狗——server 侧每 10 s 刷新、daemon 侧 90 s 无更新即退出（host 强杀 server 时 JS 清理不执行，靠它兜底）；daemon 侧用 `dir().datenum` 与 `now` 比较，避免跨系统时钟基准差异（UTC+8 下 JS 时间戳会恒定差 8 小时）。
-- **空闲回收**：daemon 连续 `MATLAB_MATE_SESSION_IDLE_MS`（默认 10 min）无作业自动退出；下次调用重建。
+- **空闲回收**：daemon 连续 `MATLAB_MATE_SESSION_IDLE_MS`（默认 5 min）无作业自动退出；下次调用重建。
 - **单飞**：同一 outDir 的并发冷启动共享一个在途启动 promise，绝不重复拉起、绝不互杀。
 - **脚本缓存**：daemon 执行每个作业前 `clear functions`——MATLAB 会缓存已解析脚本，同名脚本被改写后 `run()` 仍执行旧内容（同名重画会静默返回旧图）。
 - **防遮蔽**：daemon 全部局部变量 `scp` 前缀——`run()` 在调用方工作区执行脚本，daemon 的局部名会遮蔽同名 MATLAB 函数（曾因局部变量 `stem` 导致 stem 图 100% 失败）。
@@ -45,12 +45,16 @@
 - **错误分类**：中英文双语模式表（含中文 Windows 的 GBK 报错），延续至 v1.0.1。
 - **fake 缝**：以 Node 实现同一 daemon 协议（queue/results/heartbeat/stop/嵌套 run 展开/失败与耗时注入），无 MATLAB 环境可全链路演练。
 
+## 3.5 信任边界
+
+（queue/results/scripts）属于**本地信任边界**：daemon 会执行其中 job 的代码，对该目录有写权限者等同获得本机代码执行（与 G3 确认后的 matlab_run 同级）。同 id 预放的伪造结果不在防护范围。fake 缝不模拟 cancel 协议（仅 queue/results/heartbeat/stop）。
+
 ## 4. 兼容与开关
 
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `MATLAB_MATE_SESSION` | `auto` | `auto`=会话优先失败回退；`always`=强制会话（不回退）；`never`=一次性模式（旧行为） |
-| `MATLAB_MATE_SESSION_IDLE_MS` | `600000` | 会话空闲回收时间（daemon 连续无作业自动退出） |
+| `MATLAB_MATE_SESSION_IDLE_MS` | `300000` | 会话空闲回收时间（daemon 连续无作业自动退出） |
 | `MATLAB_MATE_BIN` / `MATLAB_MATE_ROOT` | PATH 探测 | 指定 MATLAB；显式指定但不存在时直接报错，不静默回落 |
 | `MATLAB_MATE_OUTDIR` | `<插件>/figures` | 输出目录，必须绝对路径 |
 | `MATLAB_MATE_FAKE` | — | 测试缝（含 daemon 协议模拟） |
