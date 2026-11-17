@@ -71,33 +71,50 @@ while true
     end
   end
   scpJobs = dir(fullfile(scpQueueDir, '*.job'));
+  % 过滤目录：非空目录冒充 .job 会让 delete 失败→作业永不消失→daemon 忙转且合法作业饿死
+  if ~isempty(scpJobs), scpJobs = scpJobs(~[scpJobs.isdir]); end
   if isempty(scpJobs)
     if toc(scpLastActive) > scpIdleLimit, break; end
-    % 清理没有对应 job 的取消文件（作业已被执行完或从未存在）
+    % 清理没有对应 job 的取消文件（兼容两种命名）
     scpCancels = dir(fullfile(scpQueueDir, '*.cancel'));
     for scpCi = 1:numel(scpCancels)
       scpCName = scpCancels(scpCi).name;
-      if ~exist(fullfile(scpQueueDir, [scpCName(1:end-7) '.job']), 'file')
+      if ~exist(fullfile(scpQueueDir, [scpCName(1:end-7) '.job']), 'file') && ...
+         ~exist(fullfile(scpQueueDir, [scpCName(1:end-11) '.job']), 'file')
         delete(fullfile(scpQueueDir, scpCName));
       end
     end
-    % 轮询退避：刚忙过用 30ms（低延迟），持续空闲用 250ms（省 CPU，实测 33Hz 空转占 7.6% 单核）
+    % 轮询退避：刚忙过用 30ms（低延迟），持续空闲用 250ms（省 CPU）
     if toc(scpLastActive) > 1, pause(0.25); else, pause(0.03); end
     continue;
   end
   [~, scpOrder] = sort([scpJobs.datenum]);
   scpOldest = scpJobs(scpOrder(1));
   scpStem = scpOldest.name(1:end-4);
-  % 取消文件：客户端超时后可放弃排队中的作业，避免队头阻塞
+  % 取消文件：客户端超时后可放弃排队中的作业。兼容 <id>.cancel 与 <id>.job.cancel 两种命名
   if exist(fullfile(scpQueueDir, [scpStem '.cancel']), 'file')
     delete(fullfile(scpQueueDir, scpOldest.name));
     delete(fullfile(scpQueueDir, [scpStem '.cancel']));
     continue;
   end
-  scpProcessJob(fullfile(scpOldest.folder, scpOldest.name), scpResultDir, sessionDir);
+  if exist(fullfile(scpQueueDir, [scpStem '.job.cancel']), 'file')
+    delete(fullfile(scpQueueDir, scpOldest.name));
+    delete(fullfile(scpQueueDir, [scpStem '.job.cancel']));
+    continue;
+  end
+  % 作业认领：取走时改名为 <id>.run。server 的 sessionDied 路径据此判断
+  % 作业是否可能已执行，避免盲目重试造成双重执行。
+  scpClaimed = fullfile(scpOldest.folder, [scpStem '.run']);
+  try
+    movefile(fullfile(scpOldest.folder, scpOldest.name), scpClaimed, 'f');
+  catch
+    scpClaimed = fullfile(scpOldest.folder, scpOldest.name);
+  end
+  scpProcessJob(scpClaimed, scpResultDir, sessionDir);
   scpLastActive = tic;
+  % 作业分支也退避：避免毒化场景下的 100% 忙转
+  pause(0.03);
 end
-if exist(scpStopFile, 'file'), delete(scpStopFile); end
 end
 
 function scpTouch(filePath)
@@ -153,7 +170,7 @@ scpFid = fopen(scpTmp, 'w');
 fwrite(scpFid, jsonencode(scpResult), 'char');
 fclose(scpFid);
 movefile(scpTmp, fullfile(resultDir, [scpStem '.res']), 'f');
-if exist(jobPath, 'file'), delete(jobPath); end
+try, if exist(jobPath, 'file'), delete(jobPath); end, catch, end
 % 函数返回前显式清理工作区：evalc 执行的脚本变量（yData/figHandle 等）虽为局部量，
 % 显式 clear 可促使 MATLAB 立即归还内存，抑制 daemon 常驻内存随作业数增长（实测 ~3.3MB/作业）
 clear variables;
@@ -352,18 +369,25 @@ export async function execInSession(outDir, code, { timeoutMs = 300000, env = pr
       // 不是本作业的结果（投毒/串话）：保留文件不动，继续等
     }
     if (!procAlive(state)) {
+      // 认领标记在（<id>.run）→ 作业已被 daemon 取走，可能已执行：
+      // 不删不改不重试，返回可区分错误让调用方决策（防双重执行）
+      const claimed = existsSync(join(dirs.queue, id + '.run'));
       try { unlinkSync(jobPath); } catch { /* 已被取走 */ }
+      // 认领标记（<id>.run）在原 daemon 死后无人回收：此处安全删除，防泄漏
+      if (claimed) { try { unlinkSync(join(dirs.queue, id + '.run')); } catch { /* 忽略 */ } }
       // 代际保护：仅当 Map 里仍是自己这一代才清理——否则 12ms 前刚由别的
       // 调用拉起的新 daemon 会被连带杀掉（两路都回落一次性，双倍冷启动）
       if (sessions.get(outDir) === state) await stopSession(outDir);
-      return { sessionDied: true, error: 'matlab-session-died' };
+      return claimed
+        ? { sessionDied: true, mayHaveExecuted: true, error: 'matlab-session-died-after-claim' }
+        : { sessionDied: true, error: 'matlab-session-died' };
     }
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
   }
   // 超时：只放弃本次作业（删 job + 写 cancel 让 daemon 跳过排队中的它），
   // 不杀共享会话——daemon 若已在执行则会跑完写结果，无人领取由 sweep 清理
   try { unlinkSync(jobPath); } catch { /* 已被取走 */ }
-  try { writeFileSync(`${jobPath}.cancel`, 'cancel', 'utf8'); } catch { /* 忽略 */ }
+  try { writeFileSync(join(dirs.queue, id + '.cancel'), 'cancel', 'utf8'); } catch { /* 忽略 */ }
   return { timeout: true, error: 'timeout', message: `会话作业超时（${cap}ms）`, jobPath };
 }
 

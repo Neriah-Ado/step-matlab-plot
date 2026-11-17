@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -327,6 +327,69 @@ test('回归：fake 缝坏 job 快速失败（id 回填）', async () => {
   delete process.env.FAKE_MATLAB_IDLE_MS;
 });
 
+test('回归：会话投递后死亡时重建重试一次（垂死窗口）', async () => {
+  process.env.FAKE_MATLAB_IDLE_MS = '120000';
+  // 先建会话
+  const warm = buildPlotScript({ type: 'line', name: 'retry-warm', data: { y: [1] } }, OUT);
+  const pw = scriptPathFor(OUT, 'retry-warm');
+  writeFileSync(pw, warm.value.code.replace(/%SELF_PATH%/g, pw.replace(/\\/g, '/')), 'utf8');
+  const rWarm = await execScript(pw, { outDir: OUT, timeoutMs: 30000 });
+  assert.equal(rWarm.mode, 'session');
+  // 杀掉 fake daemon：制造「投递后死亡」场景
+  const st = sessionStatus(OUT);
+  assert.equal(st.mode, 'session');
+  try { process.kill(st.pid, 'SIGKILL'); } catch { /* 已退出则忽略 */ }
+  // execScript 应重建会话并成功（而非直接回落一次性）
+  const built = buildPlotScript({ type: 'line', name: 'retry-after-death', data: { y: [1, 2] } }, OUT);
+  const p = scriptPathFor(OUT, 'retry-after-death');
+  writeFileSync(p, built.value.code.replace(/%SELF_PATH%/g, p.replace(/\\/g, '/')), 'utf8');
+  const r = await execScript(p, { outDir: OUT, timeoutMs: 30000 });
+  assert.equal(r.mode, 'session', JSON.stringify(r).slice(0, 200));
+  assert.equal(r.result?.ok, true);
+  await stopSession(OUT);
+  delete process.env.FAKE_MATLAB_IDLE_MS;
+});
+
+// ---------- V1.0.3 修复回归 ----------
+test('V1.0.3：JSON 数据通道方向与上限', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mp-json-'));
+  writeFileSync(join(dir, 'flat.json'), '{"y":[1,2,3]}', 'utf8');
+  writeFileSync(join(dir, 'nested.json'), '{"y":[[1,2,3],[4,5,6]]}', 'utf8');
+  for (const f of ['flat.json', 'nested.json']) {
+    const r = buildPlotScript({ type: 'line', name: 'j', data: { json: join(dir, f) } }, dir);
+    assert.equal(r.ok, true, r.reason);
+    assert.match(r.value.code, /iscell\(jsonPayload\.y\)/);
+    assert.match(r.value.code, /cell2mat\(cellfun/);
+    assert.match(r.value.code, /tooManyPoints/);
+    assert.doesNotMatch(r.value.code, /v\(:\)\.'/);
+  }
+});
+
+test('V1.0.3：单点 marker 覆盖多系列', () => {
+  const single = buildPlotScript({ type: 'line', name: 'm1', data: { y: [5] } }, OUT);
+  assert.match(single.value.code, /plot\(xData, yData, 'Marker', 'o'\)/);
+  const multi = buildPlotScript({ type: 'line', name: 'm2', data: { y: [[5], [3]] } }, OUT);
+  assert.match(multi.value.code, /plot\(xData, yData, 'Marker', 'o'\)/, '多系列各 1 点也应补 marker');
+  const two = buildPlotScript({ type: 'line', name: 'm3', data: { y: [1, 2] } }, OUT);
+  assert.doesNotMatch(two.value.code, /Marker/);
+});
+
+test('V1.0.3：分类标签空串/重复生成期拒绝', () => {
+  assert.equal(buildPlotScript({ type: 'bar', data: { x: ['', 'b'], y: [1, 2] } }, OUT).ok, false);
+  assert.equal(buildPlotScript({ type: 'bar', data: { x: ['a', 'a', 'b'], y: [1, 2, 3] } }, OUT).ok, false);
+  assert.equal(buildPlotScript({ type: 'bar', data: { x: ['a', 'b'], y: [1, 2] } }, OUT).ok, true);
+});
+
+test('V1.0.3：groot 白底默认值', () => {
+  const r = buildPlotScript({ type: 'line', name: 'g', data: { y: [1] } }, OUT);
+  assert.match(r.value.code, /set\(groot, 'DefaultAxesColor', 'w'/);
+});
+
+test('V1.0.3：exec 不再对 mayHaveExecuted 静默重跑', () => {
+  const src = readFileSync(join(import.meta.dirname, 'exec.mjs'), 'utf8');
+  assert.match(src, /matlab-session-died-after-claim/);
+  assert.match(src, /可能已执行；按配置不重试不回退/);
+});
 test('回归：控制字符标准对齐（toStrVector 与 validateText 一致）', () => {
   assert.equal(buildPlotScript({ type: 'pie', data: { y: [1, 2], labels: ['a\nb'] } }, OUT).ok, false);
   assert.equal(buildPlotScript({ type: 'line', legend: ['a\rb'], data: { y: [1] } }, OUT).ok, false);

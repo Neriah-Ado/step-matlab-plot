@@ -13,6 +13,31 @@ verify:
   - "会话相对一次性提速 ≥50%（实测 93.4%）"
   - "5+5+5 个子代理并行验证发现的问题全部修复并回归通过"
 versions:
+  - version: "1.0.3"
+    type: minor
+    theme: 数据保真与会话稳健性
+    status: done
+    notes: "92 个真机循环 + 9 个子代理三轮交叉验证后修复：分类轴顺序重排、深色背景、单点空白图、data.json 方向错误/无上限、重试双重执行（认领标记）、看门狗垂死窗口、队列投毒、cancel 命名错配、hardlink 绕过、0 字节假成功、数字开头图表名。68 单测 + 17 冒烟 + 51 真机循环全过"
+    tasks:
+      - id: MP-103-1
+        title: "数据保真：分类轴顺序、白底、单点 marker、data.json 方向与上限"
+        done: true
+      - id: MP-103-2
+        title: "会话稳健：作业认领标记（mayHaveExecuted 不重跑）、看门狗窗口、队列投毒、cancel 命名"
+        done: true
+      - id: MP-103-3
+        title: "安全：hardlink 拒绝+魔数嗅探、0 字节产物校验、数字开头脚本名前缀"
+        done: true
+      - id: MP-103-4
+        title: "测试：cycle-runner 51 真机循环 + 68 单测回归 + 9 子代理三轮交叉验证"
+        done: true
+    acceptance:
+      - "68 单测 + 17 冒烟 + 51 真机循环全部通过"
+      - "分类顺序/白底/单点 marker 经真机视觉确认"
+      - "副作用作业在会话死亡后计数器严格 ==1（无双重执行）"
+      - "hardlink/0 字节/数字开头名全部被拒或修复"
+    risks:
+      - "位图 ±1px、SVG 中文转路径、20 万长小数上限：已文档化为已知限制"
   - version: "1.0.2"
     type: minor
     theme: 会话稳健性与资源治理

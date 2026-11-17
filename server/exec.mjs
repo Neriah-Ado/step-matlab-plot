@@ -164,7 +164,14 @@ export async function execScript(scriptPath, { outDir, timeoutMs = 300000, env =
   // 投递/执行前清理陈旧 sidecar：上次执行的残留会让本次失败被报成假成功
   try { unlinkSync(`${scriptPath}.result.json`); } catch { /* 忽略 */ }
   if (outDir) {
-    const s = await execInSession(outDir, stmt, { timeoutMs, env, scriptPath });
+    let s = await execInSession(outDir, stmt, { timeoutMs, env, scriptPath });
+    // 会话在投递后死亡（看门狗垂死窗口/外部击杀与投递竞态）：
+    // 若作业尚未被 daemon 认领（无 <id>.run 标记），重建会话重试一次——重试仍是
+    // 会话模式，always 的「禁止一次性回退」不受影响；已被认领可能已执行的不重试
+    // （防静默双重执行，返回 mayHaveExecuted 让调用方知情）。
+    if (s && s.sessionDied && !s.mayHaveExecuted) {
+      s = await execInSession(outDir, stmt, { timeoutMs, env, scriptPath });
+    }
     if (s && s.timeout) {
       return { mode: 'session', error: 'timeout', timedOut: true, message: s.message };
     }
@@ -187,14 +194,25 @@ export async function execScript(scriptPath, { outDir, timeoutMs = 300000, env =
         ...(s.ok ? {} : { matlabError: s.error }),
       };
     }
+    if (s && s.sessionDied && s.mayHaveExecuted) {
+      // 作业已被认领可能已执行：绝不重跑（一次性回退也会重跑同一脚本）——
+      // 返回可区分错误让调用方知情，这是 V1.0.3 的核心语义保证
+      return {
+        mode: 'session',
+        error: 'matlab-session-died-after-claim',
+        message: '作业已被 daemon 认领后会话死亡，可能已执行；按配置不重试不回退',
+      };
+    }
     if (forced) {
       // 强制会话：不静默回退一次性模式
       const bin = resolveMatlabBin(env);
       if (!bin.available) return { error: 'matlab-not-found', guidance: bin.guidance };
       return {
         mode: 'session',
-        error: s?.sessionDied ? 'matlab-session-died' : 'session-unavailable',
-        message: 'MATLAB_MATE_SESSION=always：会话不可用，按配置不进行一次性回退',
+        error: s?.mayHaveExecuted ? 'matlab-session-died-after-claim' : (s?.sessionDied ? 'matlab-session-died' : 'session-unavailable'),
+        message: s?.mayHaveExecuted
+          ? 'MATLAB_MATE_SESSION=always：作业已被 daemon 认领后会话死亡，可能已执行，按配置不重试不回退'
+          : 'MATLAB_MATE_SESSION=always：会话不可用，按配置不进行一次性回退',
       };
     }
     // sessionDied：回退一次性模式（下面）

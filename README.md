@@ -50,7 +50,7 @@ cp -r step-matlab-plot ~/.stepcode/plugins/
 ## 快速开始
 
 ```bash
-# 1) 单元测试（62 项：校验/代码生成/错误分类/会话/fake 缝端到端）
+# 1) 单元测试（68 项：校验/代码生成/错误分类/会话/fake 缝/V1.0.3 修复回归）
 node --test server/lib.test.mjs
 
 # 2) 冒烟测试（stdio JSON-RPC 全协议，自动走 fake 缝）
@@ -76,6 +76,12 @@ node server/real-rounde-check.mjs
 
 # 9) V1.0.2 修复专项（dryRun 截断/陈旧 sidecar 假成功防护）
 node server/v102-fix-check.mjs
+
+# 10) V1.0.3 真机循环套件（稳定 10 + 安全 10 + 准确 21 + 修复专项 10）
+node server/cycle-runner.mjs all
+
+# 11) V1.0.3 修复视觉验证（分类顺序/白底/单点 marker）
+node server/visual-check.mjs
 ```
 
 产物写入 `figures/`（脚本在 `figures/.scripts/`，会话 spool 在 `figures/.session/`）。
@@ -148,6 +154,8 @@ step-matlab-plot/
 │   ├── real-roundd-check.mjs # 修复专项真机验证（X1/X3/X4）
 │   ├── real-rounde-check.mjs # 稳健性专项真机验证（Y1-Y4）
 │   ├── v102-fix-check.mjs   # V1.0.2 修复专项验证
+│   ├── cycle-runner.mjs     # V1.0.3 真机循环测试运行器（51 循环）
+│   ├── visual-check.mjs     # V1.0.3 修复视觉验证
 │   ├── mem-slope-check.mjs   # daemon 内存卫生验证
 │   └── exit-cleanup-check.mjs # server 退出清理验证
 ├── docs/
@@ -164,7 +172,7 @@ MIT（见 [LICENSE](LICENSE)）。设计参考了 MathWorks 官方开源项目�
 
 ## 验收状态
 
-- 单元测试 62/62 通过；冒烟 17/17 通过（fake 缝，含会话协议与批量绘图）。
+- 单元测试 68/68 通过；冒烟 17/17 通过（fake 缝，含会话协议与批量绘图）。
 - 真机 MATLAB（R2026a Update 5，`D:\Matlab`）：
   - 9 组 spec 出图成功（line/styles/scatter/bar/surf/heatmap/boxplot/histogram/errorbar），`matlab_figure_read` 视觉检查通过；
   - 会话模式连续 3 图 4.1 s vs 一次性模式 61.5 s，**提速 93.4%**；
@@ -176,4 +184,8 @@ MIT（见 [LICENSE](LICENSE)）。设计参考了 MathWorks 官方开源项目�
 - `-batch` 不可用（R2019a 之前）时的 `-nodisplay -r` 回退在 Windows MATLAB 上可能不执行 `-r` 语句；该路径仅影响不被支持的旧版本。
 - 会话 daemon 以文件队列（queue/results）通信，同一输出目录同一时刻只应有一个 server 实例使用会话模式；多实例并发请为每个实例设置不同 `MATLAB_MATE_OUTDIR`。
 - 单 outDir 的 daemon 严格串行执行：客户端超时只放弃等待并取消**排队中**的作业，已在执行的作业会跑完（队头阻塞上限为单作业超时，默认 300 s）。
+- 位图尺寸可能与 spec.size 差 ±1px（print -r96 取整）；默认 960×600 与 1280×720 实测精确。
+- 含中文的 SVG 会将文字转为路径（无可提取文本）；需要可搜索/复制文本请导出 PDF。
+- 20 万长小数内联会被 2MB 脚本上限拒绝（20 万整数可用，或改用 data.csv）。
+- 白底黑字为进程级默认：同一会话内 matlab_run 的用户代码同样继承，需要深色图请自行 set(groot, ...)。
 - daemon 常驻内存随作业数有 MATLAB 内部堆增长（实测递减趋稳：首段约 14 MB/10 张 → 尾段约 3 MB/10 张；工作区变量/figure/timer 不累积），由默认 5 分钟空闲回收兜底。

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * step-matlab-plot MCP server v1.0.2（stdio JSON-RPC，零依赖；协议与 @modelcontextprotocol/sdk 兼容）。
+ * step-matlab-plot MCP server v1.0.3（stdio JSON-RPC，零依赖；协议与 @modelcontextprotocol/sdk 兼容）。
  * 工具：matlab_env / matlab_plot_types / matlab_plot / matlab_plot_many / matlab_run / matlab_figure_ls / matlab_figure_read。
  * 安全：matlab_run 默认 dry-run，confirm=true 才执行（G3）；图表名/路径白名单（C-05）；
  *       长输出尾截断（C5）；MATLAB 缺失给安装指引。
@@ -127,6 +127,22 @@ function writeScript(scriptPath, code) {
   writeFileSync(scriptPath, code.replace(/%SELF_PATH%/g, () => selfPath), 'utf8');
 }
 
+// 产物校验：非空 + 魔数与格式相符（防双 daemon 竞争产出 0 字节却被报 ok:true）
+function verifyOutput(file, format) {
+  try {
+    const st = statSync(file);
+    if (!st.isFile() || st.size === 0) return { ok: false, reason: 'empty-output' };
+    const magic = readFileSync(file).subarray(0, 4).toString('hex');
+    const expect = { png: '89504e47', jpg: 'ffd8ff', svg: '3c', pdf: '25504446', fig: '4d41544c' }[format];
+    // svg 允许 <?xml 与 <svg 两种起始；其余按 hex 前缀比较
+    const svgOk = format === 'svg' && (magic.startsWith('3c3f') || magic.startsWith('3c73'));
+    if (expect && !magic.startsWith(expect) && !svgOk) return { ok: false, reason: 'magic-mismatch:' + format + ':' + magic };
+    return { ok: true, bytes: st.size };
+  } catch (e) {
+    return { ok: false, reason: String(e?.message ?? e) };
+  }
+}
+
 async function handlePlot(args) {
   const out = outDirOrGuidance();
   if (out.error) return out;
@@ -157,7 +173,11 @@ async function handlePlot(args) {
   if (st.mtimeMs < startedAt - 2000 && res?.ok !== true) {
     return { error: 'stale-output', name, format, outFile, mode: run.mode, reason: '输出文件未被本次执行更新（可能是预置文件）；请检查 MATLAB 执行结果', script: scriptPath };
   }
-  return { ok: true, type, name, format, file: outFile, bytes: st.size, mode: run.mode, analyzer: res?.analyzer ?? null, warnings: built.value.warnings ?? [], script: scriptPath };
+  const verified = verifyOutput(outFile, format);
+  if (!verified.ok) {
+    return { error: 'invalid-output', name, format, outFile, mode: run.mode, reason: verified.reason, script: scriptPath };
+  }
+  return { ok: true, type, name, format, file: outFile, bytes: verified.bytes, mode: run.mode, analyzer: res?.analyzer ?? null, warnings: built.value.warnings ?? [], script: scriptPath };
 }
 
 async function handleRun(args) {
@@ -269,7 +289,12 @@ function collectFigures(built, scriptPaths, run) {
       });
       return;
     }
-    figures.push({ name: b.name, type: b.type, ok: true, file: b.outFile, bytes: statSync(b.outFile).size, analyzer: res?.analyzer ?? null, warnings: b.warnings ?? [] });
+    const verified = verifyOutput(b.outFile, b.format);
+    if (!verified.ok) {
+      figures.push({ name: b.name, type: b.type, error: 'invalid-output', outFile: b.outFile, reason: verified.reason, script });
+      return;
+    }
+    figures.push({ name: b.name, type: b.type, ok: true, file: b.outFile, bytes: verified.bytes, analyzer: res?.analyzer ?? null, warnings: b.warnings ?? [] });
   });
   return { figures, okCount: figures.filter((f) => f.ok).length, total: figures.length };
 }

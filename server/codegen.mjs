@@ -6,7 +6,7 @@
 import {
   matlabStr, toNumVector, toNumMatrix, toStrVector,
   resolveDataFile, assertFormat, assertFigureName, ok, fail,
-  MAX_SERIES_COUNT, countInlineNumbers, MAX_TOTAL_NUMBERS, MAX_SCRIPT_CHARS,
+  MAX_SERIES_COUNT, countInlineNumbers, MAX_TOTAL_NUMBERS, MAX_SCRIPT_CHARS, MAX_SERIES_POINTS,
 } from './validate.mjs';
 
 export const PLOT_TYPES = {
@@ -57,6 +57,7 @@ function emitGroups(groups) {
 
 /** y 的形状：{rows: 每组点数, cols: 系列数} */
 function yShape(yInput) {
+  if (!Array.isArray(yInput)) return ok({ rows: 0, cols: 0 });
   const isNested = Array.isArray(yInput) && Array.isArray(yInput[0]);
   if (isNested) return ok({ rows: yInput[0].length, cols: yInput.length });
   return ok({ rows: yInput.length, cols: 1 });
@@ -95,7 +96,10 @@ function emitX(spec) {
   if (Array.isArray(x) && x.every((s) => typeof s === 'string')) {
     const s = toStrVector(x, 'data.x');
     if (!s.ok) return s;
-    return ok(`xData = categorical(${emitCellRow(s.value)});`);
+    // 空串/重复标签会被双参数 categorical 运行期拒绝，生成期前置拦截给可读错误
+    if (s.value.some((v) => v.trim() === '')) return fail('data.x 分类标签不能为空字符串');
+    if (new Set(s.value).size !== s.value.length) return fail('data.x 分类标签不能重复（categorical 要求唯一类别名）');
+    return ok(`xData = categorical(${emitCellRow(s.value)}, ${emitCellRow(s.value)});`);
   }
   const v = toNumVector(x, 'data.x');
   if (!v.ok) return v;
@@ -114,10 +118,20 @@ function emitDataSection(spec) {
     if (csv) {
       lines.push(`fileData = readmatrix(${matlabStr(r.value)});`);
       lines.push("if isvector(fileData), yData = fileData(:).'; else yData = fileData; end");
+      // 文件通道与内联同阈值：防 9.8MB JSON/200 万点绕过内联上限（实测 5.3s 成功）
+      lines.push('if size(yData, 1) > ' + MAX_SERIES_POINTS + ' || numel(yData) > ' + MAX_TOTAL_NUMBERS + ", error('MATLAB:stepcode:tooManyPoints', '数据规模超过上限（点数与总量）'); end");
     } else {
       lines.push(`fileText = fileread(${matlabStr(r.value)});`);
       lines.push('jsonPayload = jsondecode(fileText);');
-      lines.push("yData = cell2mat(arrayfun(@(v) double(v(:)).', jsonPayload.y, 'UniformOutput', false));");
+      // 方向修正：嵌套 [[s1],[s2]] → 点数×系列（每组成一列）；平坦数组 → 列向量。
+      // 旧实现 v(:). 横向拼接：1×N 被 64 列截断后全部画在 x=1（静默失真）。
+      lines.push('if iscell(jsonPayload.y)');
+      lines.push("  yData = cell2mat(cellfun(@(v) double(v(:)), jsonPayload.y, 'UniformOutput', false));");
+      lines.push('else');
+      lines.push('  yData = double(jsonPayload.y(:));');
+      lines.push('end');
+      // 文件通道与内联同阈值：防 9.8MB JSON/200 万点绕过内联上限（实测 5.3s 成功）
+      lines.push('if size(yData, 1) > ' + MAX_SERIES_POINTS + ' || numel(yData) > ' + MAX_TOTAL_NUMBERS + ", error('MATLAB:stepcode:tooManyPoints', '数据规模超过上限（点数与总量）'); end");
     }
     return ok(lines.join('\n'));
   }
@@ -157,7 +171,13 @@ function buildPlotSection(type, spec) {
   const L = [];
   const cat = xIsCategorical(spec);
   switch (type) {
-    case 'line':
+    case 'line': {
+      // 单点数据不成线：补 marker 否则图为空白（实测 1 点出图无数据痕迹）
+      const shape = yShape(spec?.data?.y);
+      const single = shape.ok && shape.value.rows === 1; // 单点数据（含多系列各 1 点）不成线，补 marker
+      L.push(single ? `chartHandles = plot(xData, yData, 'Marker', 'o');` : `chartHandles = plot(xData, yData);`);
+      break;
+    }
     case 'area':
     case 'stem':
     case 'stairs':
@@ -533,6 +553,9 @@ export function buildPlotScript(spec, outDir, options = {}) {
   const size = spec.size ?? {};
   const W = Math.floor(Number(size.width ?? 960));
   const H = Math.floor(Number(size.height ?? 600));
+  // 显式设置 groot 默认值：R2026a 无头环境 FactoryAxesColor 为深色（#121212），
+  // 尽管 axes.Color 读作白色，导出图绘图区仍近黑——「出版级」图需白底黑字
+  L.push("set(groot, 'DefaultAxesColor', 'w', 'DefaultAxesXColor', 'k', 'DefaultAxesYColor', 'k', 'DefaultAxesZColor', 'k', 'DefaultAxesGridColor', [0.8 0.8 0.8]);");
   L.push(`figHandle = figure('Visible', 'off', 'Color', 'w', 'Units', 'pixels', 'Position', [0 0 ${W} ${H}]);`);
 
   // ---- 绘图段 ----
